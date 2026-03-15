@@ -179,12 +179,62 @@ app.post('/shifts', async (req, res) => {
   const tenantId = req.headers['x-tenant-id'];
   const { employee_id, date, start_time, end_time, break_minutes } = req.body;
   try {
+    const warnings = [];
+    
+    // Check for rest period (dygnsvila >= 11h between shifts)
+    const prevShift = await pool.query(
+      `SELECT end_time FROM shifts 
+       WHERE tenant_id = $1 AND employee_id = $2 AND date < $3 
+       ORDER BY date DESC, start_time DESC LIMIT 1`,
+      [tenantId, employee_id, date]
+    );
+    
+    if (prevShift.rows.length > 0) {
+      // Calculate hours between end of previous shift and start of this shift
+      const prevEndTime = prevShift.rows[0].end_time;
+      const prevDate = new Date(date);
+      prevDate.setDate(prevDate.getDate() - 1); // Assume previous shift is yesterday or earlier
+      
+      const prevEndDateTime = new Date(`${prevDate.toISOString().split('T')[0]}T${prevEndTime}:00Z`);
+      const thisStartDateTime = new Date(`${date}T${start_time}:00Z`);
+      const hoursBetween = (thisStartDateTime - prevEndDateTime) / (1000 * 60 * 60);
+      
+      if (hoursBetween < 11) {
+        warnings.push(`Dygnsvila: ${Math.round(hoursBetween * 10) / 10}h (rekommendation: >= 11h)`);
+      }
+    }
+    
+    // Check for weekly rest (veckovila >= 36h per week)
+    const weekStart = new Date(date);
+    weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekEnd.getDate() + 7);
+    
+    const weeklyHours = await pool.query(
+      `SELECT 
+       SUM(EXTRACT(HOUR FROM (end_time - start_time)) - COALESCE(break_minutes, 0) / 60.0) as total_hours
+       FROM shifts 
+       WHERE tenant_id = $1 AND employee_id = $2 
+       AND date >= $3 AND date < $4`,
+      [tenantId, employee_id, weekStart.toISOString().split('T')[0], weekEnd.toISOString().split('T')[0]]
+    );
+    
+    const currentWeekHours = weeklyHours.rows[0].total_hours || 0;
+    const shiftHours = (new Date(`2000-01-01T${end_time}:00`) - new Date(`2000-01-01T${start_time}:00`)) / (1000 * 60 * 60) - (break_minutes || 0) / 60;
+    const totalHours = currentWeekHours + shiftHours;
+    const weeklyRest = 7 * 24 - totalHours;
+    
+    if (weeklyRest < 36) {
+      warnings.push(`Veckovila: ${Math.round(weeklyRest * 10) / 10}h (rekommendation: >= 36h)`);
+    }
+    
+    // Insert shift
     const result = await pool.query(
       `INSERT INTO shifts (tenant_id, employee_id, date, start_time, end_time, break_minutes)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
       [tenantId, employee_id, date, start_time, end_time, break_minutes || 0]
     );
-    res.status(201).json({ shift: result.rows[0], warnings: [] });
+    res.status(201).json({ shift: result.rows[0], warnings });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
