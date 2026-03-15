@@ -320,10 +320,28 @@ app.post('/shifts/copy-week', async (req, res) => {
 app.post('/time/clock-in', async (req, res) => {
   const tenantId = req.headers['x-tenant-id'];
   const { employee_id, shift_id } = req.body;
+  
+  if (!employee_id) {
+    return res.status(400).json({ error: 'employee_id is required' });
+  }
+  
   try {
+    // Check for active clock-in (prevent duplicates)
+    const activeEntry = await pool.query(
+      `SELECT id FROM time_entries WHERE tenant_id = $1 AND employee_id = $2 AND clock_out IS NULL AND status = 'active'`,
+      [tenantId, employee_id]
+    );
+    
+    if (activeEntry.rows.length > 0) {
+      return res.status(409).json({ 
+        error: 'Employee is already clocked in',
+        conflictingEntryId: activeEntry.rows[0].id 
+      });
+    }
+    
     const result = await pool.query(
-      `INSERT INTO time_entries (tenant_id, employee_id, clock_in, shift_id)
-       VALUES ($1, $2, NOW(), $3) RETURNING *`,
+      `INSERT INTO time_entries (tenant_id, employee_id, clock_in, shift_id, status)
+       VALUES ($1, $2, NOW(), $3, 'active') RETURNING *`,
       [tenantId, employee_id, shift_id]
     );
     res.status(201).json({ timeEntry: result.rows[0] });
@@ -334,13 +352,48 @@ app.post('/time/clock-in', async (req, res) => {
 
 app.post('/time/clock-out', async (req, res) => {
   const tenantId = req.headers['x-tenant-id'];
-  const { id } = req.body;
+  const { id, employee_id } = req.body;
+  
+  if (!id && !employee_id) {
+    return res.status(400).json({ error: 'id or employee_id is required' });
+  }
+  
   try {
+    // If employee_id provided, find active entry for employee
+    let entryId = id;
+    if (!id && employee_id) {
+      const activeEntry = await pool.query(
+        `SELECT id FROM time_entries WHERE tenant_id = $1 AND employee_id = $2 AND clock_out IS NULL AND status = 'active'`,
+        [tenantId, employee_id]
+      );
+      
+      if (activeEntry.rows.length === 0) {
+        return res.status(400).json({ 
+          error: 'No active clock-in found for this employee' 
+        });
+      }
+      entryId = activeEntry.rows[0].id;
+    }
+    
+    // Verify entry exists and is active before updating
+    const entryCheck = await pool.query(
+      `SELECT * FROM time_entries WHERE id = $1 AND tenant_id = $2`,
+      [entryId, tenantId]
+    );
+    
+    if (entryCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Time entry not found' });
+    }
+    
+    if (entryCheck.rows[0].clock_out) {
+      return res.status(400).json({ error: 'This entry is already clocked out' });
+    }
+    
     const result = await pool.query(
       `UPDATE time_entries SET clock_out = NOW(), status = 'completed' WHERE id = $1 AND tenant_id = $2 RETURNING *`,
-      [id, tenantId]
+      [entryId, tenantId]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Time entry not found' });
+    
     res.json({ timeEntry: result.rows[0] });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -349,12 +402,93 @@ app.post('/time/clock-out', async (req, res) => {
 
 app.get('/time/entries', async (req, res) => {
   const tenantId = req.headers['x-tenant-id'];
+  const { date } = req.query;
+  try {
+    let query = 'SELECT * FROM time_entries WHERE tenant_id = $1';
+    const params = [tenantId];
+    
+    if (date) {
+      query += ` AND DATE(clock_in) = $${params.length + 1}`;
+      params.push(date);
+    }
+    
+    query += ' ORDER BY clock_in DESC';
+    const result = await pool.query(query, params);
+    res.json({ timeEntries: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/time/entries/:id/approve', async (req, res) => {
+  const tenantId = req.headers['x-tenant-id'];
+  const { id } = req.params;
+  const { approved_by } = req.body;
+  
+  if (!approved_by) {
+    return res.status(400).json({ error: 'approved_by is required' });
+  }
+  
   try {
     const result = await pool.query(
-      'SELECT * FROM time_entries WHERE tenant_id = $1 ORDER BY clock_in DESC',
-      [tenantId]
+      `UPDATE time_entries SET status = 'approved', approved_by = $1 WHERE id = $2 AND tenant_id = $3 RETURNING *`,
+      [approved_by, id, tenantId]
     );
-    res.json({ timeEntries: result.rows });
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Time entry not found' });
+    }
+    
+    res.json({ timeEntry: result.rows[0] });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/time/personalliggare', async (req, res) => {
+  const tenantId = req.headers['x-tenant-id'];
+  const { date } = req.query;
+  
+  if (!date) {
+    return res.status(400).json({ error: 'date parameter is required (YYYY-MM-DD)' });
+  }
+  
+  try {
+    // Fetch time entries with employee details in Skatteverket-kompatibelt format
+    const result = await pool.query(
+      `SELECT 
+         e.id as employee_id,
+         e.personnummer_encrypted as personnummer,
+         e.first_name,
+         e.last_name,
+         te.clock_in,
+         te.clock_out,
+         te.status,
+         s.id as workplace_id
+       FROM time_entries te
+       JOIN employees e ON te.employee_id = e.id
+       LEFT JOIN shifts s ON te.shift_id = s.id
+       WHERE te.tenant_id = $1 AND DATE(te.clock_in) = $2
+       ORDER BY e.last_name, e.first_name, te.clock_in`,
+      [tenantId, date]
+    );
+    
+    // Format for Skatteverket
+    const personalliggare = result.rows.map(row => ({
+      personnummer: row.personnummer,
+      namn: `${row.first_name} ${row.last_name}`,
+      tidpunkt_in: row.clock_in,
+      tidpunkt_ut: row.clock_out,
+      arbetsplats_id: row.workplace_id,
+      status: row.status,
+      datum: date
+    }));
+    
+    res.json({ 
+      date,
+      personalliggare,
+      totalRows: personalliggare.length 
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
